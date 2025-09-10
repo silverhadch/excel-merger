@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import threading
 from collections import OrderedDict
+import time
 
 # ----------------------
 # Arguments
@@ -27,16 +28,24 @@ parser.add_argument(
     default=8,
     help="Number of reading threads"
 )
+parser.add_argument(
+    "--batch-size",
+    type=int,
+    default=1000,
+    help="Number of rows to process in batch"
+)
 args = parser.parse_args()
 
 print("Source info enabled:", args.source_info)
 print("Keep duplicates:", args.keep_duplicates)
 print("Threads:", args.threads)
+print("Batch size:", args.batch_size)
 
 # ----------------------
 # Collect files
 # ----------------------
 files = glob.glob("files/*.xlsx")
+print(f"Found {len(files)} files to process")
 
 # ----------------------
 # Output workbook (streaming)
@@ -48,92 +57,131 @@ ws_out = wb_out.create_sheet("Merged")
 # Global header management
 # ----------------------
 header_lock = threading.Lock()
-all_headers = OrderedDict()  # Maps header name to column index
+all_headers = OrderedDict()
 header_ready = threading.Event()
 seen_rows = set() if not args.keep_duplicates else None
 
 # ----------------------
-# Thread-safe queue for rows
+# Thread-safe queue for rows with batching
 # ----------------------
-row_queue = queue.Queue(maxsize=10000)  # Limit memory usage
+row_queue = queue.Queue(maxsize=5000)
+batch_buffer = []
+batch_lock = threading.Lock()
 
 def file_reader(f):
-    wb_in = load_workbook(f, read_only=True, data_only=True)
-    for sheet_name in wb_in.sheetnames:
-        ws_in = wb_in[sheet_name]
-        rows_iter = ws_in.iter_rows(values_only=True)
-        try:
-            first_row = next(rows_iter)
-        except StopIteration:
-            continue
+    try:
+        wb_in = load_workbook(f, read_only=True, data_only=True)
+        file_headers_cache = {}
+        source_headers = ["source_file", "source_sheet"] if args.source_info else []
 
-        # Process headers
-        file_headers = [str(h).strip() if h is not None else "" for h in first_row]
+        for sheet_name in wb_in.sheetnames:
+            ws_in = wb_in[sheet_name]
+            rows = list(ws_in.iter_rows(values_only=True))
 
-        # Add source info headers if needed
-        source_headers = []
-        if args.source_info:
-            source_headers = ["source_file", "source_sheet"]
+            if not rows:
+                continue
 
-        # Update global headers with lock
-        with header_lock:
-            # Add any new headers to our global header dict
-            for header in file_headers + source_headers:
-                if header not in all_headers:
-                    all_headers[header] = len(all_headers)
+            first_row = rows[0]
+            file_headers = [str(h).strip() if h is not None else "" for h in first_row]
 
-            # If this is the first file, send the header row
+            # Cache header mapping for this file
+            header_mapping = []
+            for i, header in enumerate(file_headers):
+                with header_lock:
+                    if header not in all_headers:
+                        all_headers[header] = len(all_headers)
+                    header_mapping.append((i, all_headers[header]))
+
+            # Add source headers to mapping
+            source_mapping = []
+            for header in source_headers:
+                with header_lock:
+                    if header not in all_headers:
+                        all_headers[header] = len(all_headers)
+                    source_mapping.append(all_headers[header])
+
+            # Send header if first file
             if not header_ready.is_set():
-                full_header_row = [""] * len(all_headers)
-                for header, idx in all_headers.items():
-                    full_header_row[idx] = header
-                row_queue.put(("header", full_header_row))
-                header_ready.set()
+                with header_lock:
+                    full_header_row = [""] * len(all_headers)
+                    for header, idx in all_headers.items():
+                        full_header_row[idx] = header
+                    row_queue.put(("header", full_header_row))
+                    header_ready.set()
 
-        # Process data rows
-        for row in rows_iter:
-            # Convert row to list and handle None values
-            row_data = [str(cell).strip() if cell is not None else "" for cell in row]
+            # Process data rows in batches
+            batch = []
+            for row in rows[1:]:  # Skip header row
+                if row is None:
+                    continue
 
-            # Add source info if needed
-            if args.source_info:
-                row_data += [f, sheet_name]
+                # Create ordered row with pre-allocated list
+                ordered_row = [""] * len(all_headers)
 
-            # Create a properly ordered row based on global headers
-            ordered_row = [""] * len(all_headers)
+                # Map file data
+                for src_idx, dst_idx in header_mapping:
+                    if src_idx < len(row) and row[src_idx] is not None:
+                        ordered_row[dst_idx] = str(row[src_idx]).strip()
 
-            # Map each value to its correct column based on header position
-            for i, value in enumerate(row_data):
-                if i < len(file_headers):
-                    header_name = file_headers[i]
-                else:
-                    # This handles source info columns
-                    header_name = source_headers[i - len(file_headers)]
+                # Add source info
+                if args.source_info:
+                    for i, dst_idx in enumerate(source_mapping):
+                        if i == 0:
+                            ordered_row[dst_idx] = f
+                        elif i == 1:
+                            ordered_row[dst_idx] = sheet_name
 
-                if header_name in all_headers:
-                    col_idx = all_headers[header_name]
-                    ordered_row[col_idx] = value
+                # Check duplicates
+                row_tuple = tuple(ordered_row)
+                if args.keep_duplicates or row_tuple not in seen_rows:
+                    if not args.keep_duplicates:
+                        seen_rows.add(row_tuple)
+                    batch.append(ordered_row)
 
-            # Check for duplicates if needed
-            row_tuple = tuple(ordered_row)
-            if args.keep_duplicates or row_tuple not in seen_rows:
-                if not args.keep_duplicates:
-                    seen_rows.add(row_tuple)
-                row_queue.put(("row", ordered_row))
+                    # Send batch when full
+                    if len(batch) >= args.batch_size:
+                        row_queue.put(("batch", batch))
+                        batch = []
 
+            # Send remaining rows in batch
+            if batch:
+                row_queue.put(("batch", batch))
+
+    except Exception as e:
+        print(f"Error processing file {f}: {e}")
+    finally:
+        if 'wb_in' in locals():
+            wb_in.close()
     return f
 
 # ----------------------
-# Writer thread
+# Writer thread with batching
 # ----------------------
 def writer():
+    processed = 0
+    start_time = time.time()
+
     while True:
         item = row_queue.get()
         if item == "DONE":
             break
+
         typ, data = item
-        ws_out.append(data)
+        if typ == "batch":
+            for row in data:
+                ws_out.append(row)
+                processed += 1
+
+                # Progress reporting
+                if processed % 10000 == 0:
+                    elapsed = time.time() - start_time
+                    print(f"Processed {processed} rows in {elapsed:.2f}s ({processed/elapsed:.0f} rows/s)")
+        else:
+            ws_out.append(data)
+
         row_queue.task_done()
+
+    print(f"Total rows written: {processed}")
 
 # ----------------------
 # Start writer thread
@@ -142,17 +190,26 @@ writer_thread = threading.Thread(target=writer)
 writer_thread.start()
 
 # ----------------------
-# Start reading threads
+# Start reading threads with progress
 # ----------------------
+start_time = time.time()
 with ThreadPoolExecutor(max_workers=args.threads) as executor:
-    futures = [executor.submit(file_reader, f) for f in files]
-    for _ in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
-        pass
+    futures = {executor.submit(file_reader, f): f for f in files}
+
+    for future in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
+        try:
+            future.result()
+        except Exception as e:
+            print(f"Error: {e}")
 
 # ----------------------
 # Finish
 # ----------------------
 row_queue.put("DONE")
 writer_thread.join()
+
+total_time = time.time() - start_time
+print(f"Processing completed in {total_time:.2f} seconds")
+
 wb_out.save("result/merged.xlsx")
 print("Done → result/merged.xlsx")
