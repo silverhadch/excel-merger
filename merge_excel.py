@@ -2,6 +2,9 @@ import argparse
 import glob
 from tqdm import tqdm
 from openpyxl import Workbook, load_workbook
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import queue
+import threading
 
 # ----------------------
 # Arguments
@@ -12,8 +15,16 @@ parser.add_argument(
     action="store_true",
     help="Include source information"
 )
+parser.add_argument(
+    "--threads",
+    type=int,
+    default=8,
+    help="Number of reading threads"
+)
 args = parser.parse_args()
+
 print("Source info enabled:", args.source_info)
+print("Threads:", args.threads)
 
 # ----------------------
 # Collect files
@@ -26,46 +37,72 @@ files = glob.glob("files/*.xlsx")
 wb_out = Workbook(write_only=True)
 ws_out = wb_out.create_sheet("Merged")
 
-header_written = False
+header_written = threading.Event()
 
 # ----------------------
-# Process files
+# Thread-safe queue for rows
 # ----------------------
-for f in tqdm(files, desc="Processing files"):
+row_queue = queue.Queue(maxsize=10000)  # Limit memory usage
+
+def file_reader(f):
+    rows_to_write = []
     wb_in = load_workbook(f, read_only=True, data_only=True)
-    for sheet_name in tqdm(wb_in.sheetnames, desc=f"  {f}", leave=False):
+    for sheet_name in wb_in.sheetnames:
         ws_in = wb_in[sheet_name]
-
         rows_iter = ws_in.iter_rows(values_only=True)
-
         try:
-            # Read first row
             first_row = next(rows_iter)
         except StopIteration:
-            # Empty sheet, skip
             continue
 
-        # Write header once
-        if not header_written:
+        # Include source info in header/rows
+        if not header_written.is_set():
             header = list(first_row)
             if args.source_info:
                 header += ["source_file", "source_sheet"]
-            ws_out.append(header)
-            header_written = True
+            row_queue.put(("header", header))
+            header_written.set()
         else:
-            # Skip header of subsequent sheets
-            pass
+            pass  # skip first row
 
-        # Write remaining rows
         for row in rows_iter:
-            row = list(row)
+            row_list = list(row)
             if args.source_info:
-                row += [f, sheet_name]
-            ws_out.append(row)
+                row_list += [f, sheet_name]
+            row_queue.put(("row", row_list))
+    return f
 
 # ----------------------
-# Save result
+# Writer thread
 # ----------------------
+def writer():
+    while True:
+        item = row_queue.get()
+        if item == "DONE":
+            break
+        typ, data = item
+        ws_out.append(data)
+        row_queue.task_done()
+
+# ----------------------
+# Start writer thread
+# ----------------------
+writer_thread = threading.Thread(target=writer)
+writer_thread.start()
+
+# ----------------------
+# Start reading threads
+# ----------------------
+with ThreadPoolExecutor(max_workers=args.threads) as executor:
+    futures = [executor.submit(file_reader, f) for f in files]
+    for _ in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
+        pass
+
+# ----------------------
+# Finish
+# ----------------------
+row_queue.put("DONE")
+writer_thread.join()
 wb_out.save("result/merged.xlsx")
 print("Done → result/merged.xlsx")
 
