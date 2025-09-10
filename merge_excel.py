@@ -26,7 +26,7 @@ for f in files:
     xls = pd.ExcelFile(f)
     for sheet_name in xls.sheet_names:
         df = xls.parse(sheet_name)
-        if source_info:
+        if args.source_info:
             df["source_file"] = f
             df["source_sheet"] = sheet_name
         merged = pd.concat([merged, df], ignore_index=True)
