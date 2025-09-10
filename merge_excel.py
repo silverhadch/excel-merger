@@ -1,35 +1,71 @@
 import argparse
-import pandas as pd
-import glob as glb
+import glob
+from tqdm import tqdm
+from openpyxl import Workbook, load_workbook
 
-# Setup Cmdline Parser
+# ----------------------
+# Arguments
+# ----------------------
 parser = argparse.ArgumentParser()
-
 parser.add_argument(
     "--source-info",
-    dest="source_info",
     action="store_true",
     help="Include source information"
 )
-
 args = parser.parse_args()
-
 print("Source info enabled:", args.source_info)
 
-# collect all Excel files in files folder
-files = glb.glob("files/*.xlsx")
+# ----------------------
+# Collect files
+# ----------------------
+files = glob.glob("files/*.xlsx")
 
-merged = pd.DataFrame()
+# ----------------------
+# Output workbook (streaming)
+# ----------------------
+wb_out = Workbook(write_only=True)
+ws_out = wb_out.create_sheet("Merged")
 
-for f in files:
-    # read all sheets from the file
-    xls = pd.ExcelFile(f)
-    for sheet_name in xls.sheet_names:
-        df = xls.parse(sheet_name)
-        if args.source_info:
-            df["source_file"] = f
-            df["source_sheet"] = sheet_name
-        merged = pd.concat([merged, df], ignore_index=True)
+header_written = False
 
-# write to a single Excel file
-merged.to_excel("result/merged.xlsx", index=False)
+# ----------------------
+# Process files
+# ----------------------
+for f in tqdm(files, desc="Processing files"):
+    wb_in = load_workbook(f, read_only=True, data_only=True)
+    for sheet_name in tqdm(wb_in.sheetnames, desc=f"  {f}", leave=False):
+        ws_in = wb_in[sheet_name]
+
+        rows_iter = ws_in.iter_rows(values_only=True)
+
+        try:
+            # Read first row
+            first_row = next(rows_iter)
+        except StopIteration:
+            # Empty sheet, skip
+            continue
+
+        # Write header once
+        if not header_written:
+            header = list(first_row)
+            if args.source_info:
+                header += ["source_file", "source_sheet"]
+            ws_out.append(header)
+            header_written = True
+        else:
+            # Skip header of subsequent sheets
+            pass
+
+        # Write remaining rows
+        for row in rows_iter:
+            row = list(row)
+            if args.source_info:
+                row += [f, sheet_name]
+            ws_out.append(row)
+
+# ----------------------
+# Save result
+# ----------------------
+wb_out.save("result/merged.xlsx")
+print("Done → result/merged.xlsx")
+
