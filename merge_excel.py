@@ -5,6 +5,7 @@ from openpyxl import Workbook, load_workbook
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import queue
 import threading
+from collections import OrderedDict
 
 # ----------------------
 # Arguments
@@ -16,6 +17,11 @@ parser.add_argument(
     help="Include source information"
 )
 parser.add_argument(
+    "--keep-duplicates",
+    action="store_true",
+    help="Keep duplicate rows instead of removing them"
+)
+parser.add_argument(
     "--threads",
     type=int,
     default=8,
@@ -24,6 +30,7 @@ parser.add_argument(
 args = parser.parse_args()
 
 print("Source info enabled:", args.source_info)
+print("Keep duplicates:", args.keep_duplicates)
 print("Threads:", args.threads)
 
 # ----------------------
@@ -37,7 +44,13 @@ files = glob.glob("files/*.xlsx")
 wb_out = Workbook(write_only=True)
 ws_out = wb_out.create_sheet("Merged")
 
-header_written = threading.Event()
+# ----------------------
+# Global header management
+# ----------------------
+header_lock = threading.Lock()
+all_headers = OrderedDict()  # Maps header name to column index
+header_ready = threading.Event()
+seen_rows = set() if not args.keep_duplicates else None
 
 # ----------------------
 # Thread-safe queue for rows
@@ -45,7 +58,6 @@ header_written = threading.Event()
 row_queue = queue.Queue(maxsize=10000)  # Limit memory usage
 
 def file_reader(f):
-    rows_to_write = []
     wb_in = load_workbook(f, read_only=True, data_only=True)
     for sheet_name in wb_in.sheetnames:
         ws_in = wb_in[sheet_name]
@@ -55,21 +67,60 @@ def file_reader(f):
         except StopIteration:
             continue
 
-        # Include source info in header/rows
-        if not header_written.is_set():
-            header = list(first_row)
-            if args.source_info:
-                header += ["source_file", "source_sheet"]
-            row_queue.put(("header", header))
-            header_written.set()
-        else:
-            pass  # skip first row
+        # Process headers
+        file_headers = [str(h).strip() if h is not None else "" for h in first_row]
 
+        # Add source info headers if needed
+        source_headers = []
+        if args.source_info:
+            source_headers = ["source_file", "source_sheet"]
+
+        # Update global headers with lock
+        with header_lock:
+            # Add any new headers to our global header dict
+            for header in file_headers + source_headers:
+                if header not in all_headers:
+                    all_headers[header] = len(all_headers)
+
+            # If this is the first file, send the header row
+            if not header_ready.is_set():
+                full_header_row = [""] * len(all_headers)
+                for header, idx in all_headers.items():
+                    full_header_row[idx] = header
+                row_queue.put(("header", full_header_row))
+                header_ready.set()
+
+        # Process data rows
         for row in rows_iter:
-            row_list = list(row)
+            # Convert row to list and handle None values
+            row_data = [str(cell).strip() if cell is not None else "" for cell in row]
+
+            # Add source info if needed
             if args.source_info:
-                row_list += [f, sheet_name]
-            row_queue.put(("row", row_list))
+                row_data += [f, sheet_name]
+
+            # Create a properly ordered row based on global headers
+            ordered_row = [""] * len(all_headers)
+
+            # Map each value to its correct column based on header position
+            for i, value in enumerate(row_data):
+                if i < len(file_headers):
+                    header_name = file_headers[i]
+                else:
+                    # This handles source info columns
+                    header_name = source_headers[i - len(file_headers)]
+
+                if header_name in all_headers:
+                    col_idx = all_headers[header_name]
+                    ordered_row[col_idx] = value
+
+            # Check for duplicates if needed
+            row_tuple = tuple(ordered_row)
+            if args.keep_duplicates or row_tuple not in seen_rows:
+                if not args.keep_duplicates:
+                    seen_rows.add(row_tuple)
+                row_queue.put(("row", ordered_row))
+
     return f
 
 # ----------------------
@@ -105,4 +156,3 @@ row_queue.put("DONE")
 writer_thread.join()
 wb_out.save("result/merged.xlsx")
 print("Done → result/merged.xlsx")
-
