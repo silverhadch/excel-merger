@@ -7,6 +7,7 @@ import queue
 import threading
 from collections import OrderedDict
 import time
+import gc
 
 # ----------------------
 # Arguments
@@ -25,14 +26,20 @@ parser.add_argument(
 parser.add_argument(
     "--threads",
     type=int,
-    default=8,
+    default=4,  # Reduced default to save memory
     help="Number of reading threads"
 )
 parser.add_argument(
     "--batch-size",
     type=int,
-    default=1000,
+    default=500,  # Reduced batch size
     help="Number of rows to process in batch"
+)
+parser.add_argument(
+    "--max-memory-rows",
+    type=int,
+    default=100000,  # Limit total rows in memory
+    help="Maximum rows to keep in memory before flushing"
 )
 args = parser.parse_args()
 
@@ -40,6 +47,7 @@ print("Source info enabled:", args.source_info)
 print("Keep duplicates:", args.keep_duplicates)
 print("Threads:", args.threads)
 print("Batch size:", args.batch_size)
+print("Max memory rows:", args.max_memory_rows)
 
 # ----------------------
 # Collect files
@@ -61,90 +69,43 @@ all_headers = OrderedDict()
 header_ready = threading.Event()
 seen_rows = set() if not args.keep_duplicates else None
 
-def extract_data_from_chartsheet(ws):
-    """Extract data from chartsheet by checking for any available data"""
-    rows = []
+# ----------------------
+# Memory management
+# ----------------------
+memory_counter = 0
+memory_lock = threading.Lock()
 
-    # Try to get data from chart titles or any text elements
-    try:
-        # Chartsheets might have a title or some text content
-        if hasattr(ws, 'title'):
-            rows.append(['Chart_Title', ws.title])
+def check_memory_usage():
+    """Check if we're approaching memory limits and trigger GC if needed"""
+    global memory_counter
+    with memory_lock:
+        if memory_counter >= args.max_memory_rows:
+            gc.collect()  # Force garbage collection
+            memory_counter = 0
+            return True
+    return False
 
-        # Some chartsheets might have embedded data tables
-        # This is a best-effort approach to extract any available data
-        if hasattr(ws, 'charts') and ws.charts:
-            for i, chart in enumerate(ws.charts):
-                # Try to get chart title
-                if hasattr(chart, 'title') and chart.title and hasattr(chart.title, 'text'):
-                    rows.append([f'Chart_{i}_Title', str(chart.title.text)])
-
-                # Try to get series names if available
-                if hasattr(chart, 'series') and chart.series:
-                    for j, series in enumerate(chart.series):
-                        series_name = getattr(series, 'name', f'Series_{j}')
-                        rows.append([f'Chart_{i}_Series_{j}', str(series_name)])
-    except Exception as e:
-        # If we can't extract data, just return empty
-        pass
-
-    return rows
+# ----------------------
+# Thread-safe queue for rows with memory limits
+# ----------------------
+row_queue = queue.Queue(maxsize=1000)  # Smaller queue to limit memory
 
 def process_sheet(ws, sheet_name, f):
-    """Process any type of sheet (worksheet or chartsheet)"""
-    rows = []
+    """Process sheet with streaming to avoid loading all rows at once"""
+    rows_processed = 0
 
-    # Regular worksheet
+    # Regular worksheet - process row by row
     if hasattr(ws, 'iter_rows'):
         try:
-            for row in ws.iter_rows(values_only=True):
-                if row and any(cell is not None for cell in row):
-                    rows.append([str(cell).strip() if cell is not None else "" for cell in row])
-        except Exception as e:
-            print(f"Warning: Could not read worksheet '{sheet_name}' in file '{f}': {e}")
+            rows_iter = ws.iter_rows(values_only=True)
+            first_row = next(rows_iter, None)
+            if not first_row:
+                return 0
 
-    # Chartsheet - try to extract any available data
-    elif hasattr(ws, 'charts'):
-        try:
-            chart_data = extract_data_from_chartsheet(ws)
-            if chart_data:
-                rows.extend(chart_data)
-                # Add a simple header if we found data
-                if rows and len(rows[0]) == 2:
-                    rows.insert(0, ['Chart_Element', 'Value'])
-        except Exception as e:
-            print(f"Info: Limited data available in chartsheet '{sheet_name}' in file '{f}'")
-
-    # Hidden sheets
-    elif hasattr(ws, 'sheet_state') and ws.sheet_state == 'hidden':
-        print(f"Info: Skipping hidden sheet '{sheet_name}' in file '{f}'")
-        return []
-
-    return rows
-
-# ----------------------
-# Thread-safe queue for rows with batching
-# ----------------------
-row_queue = queue.Queue(maxsize=5000)
-
-def file_reader(f):
-    try:
-        wb_in = load_workbook(f, read_only=True, data_only=True)
-        source_headers = ["source_file", "source_sheet"] if args.source_info else []
-
-        for sheet_name in wb_in.sheetnames:
-            ws_in = wb_in[sheet_name]
-
-            # Process all types of sheets
-            rows = process_sheet(ws_in, sheet_name, f)
-
-            if not rows:
-                continue
-
-            first_row = rows[0]
             file_headers = [str(h).strip() if h is not None else "" for h in first_row]
+            source_headers = ["source_file", "source_sheet"] if args.source_info else []
 
-            # Cache header mapping for this file
+            # Cache header mapping
             header_mapping = []
             for i, header in enumerate(file_headers):
                 with header_lock:
@@ -169,13 +130,13 @@ def file_reader(f):
                     row_queue.put(("header", full_header_row))
                     header_ready.set()
 
-            # Process data rows in batches
+            # Process rows in streaming fashion
             batch = []
-            for row in rows[1:]:  # Skip header row
-                if not row:
+            for row in rows_iter:
+                if row is None:
                     continue
 
-                # Create ordered row with pre-allocated list
+                # Create ordered row
                 ordered_row = [""] * len(all_headers)
 
                 # Map file data
@@ -197,25 +158,57 @@ def file_reader(f):
                     if not args.keep_duplicates:
                         seen_rows.add(row_tuple)
                     batch.append(ordered_row)
+                    rows_processed += 1
 
-                    # Send batch when full
-                    if len(batch) >= args.batch_size:
+                    # Check memory and send batch
+                    if len(batch) >= args.batch_size or check_memory_usage():
                         row_queue.put(("batch", batch))
                         batch = []
+                        global memory_counter
+                        with memory_lock:
+                            memory_counter += len(batch)
 
-            # Send remaining rows in batch
+            # Send remaining rows
             if batch:
                 row_queue.put(("batch", batch))
+                with memory_lock:
+                    memory_counter += len(batch)
+
+        except Exception as e:
+            print(f"Warning: Could not read worksheet '{sheet_name}' in file '{f}': {e}")
+
+    return rows_processed
+
+def file_reader(f):
+    try:
+        total_rows = 0
+        wb_in = load_workbook(f, read_only=True, data_only=True)
+
+        for sheet_name in wb_in.sheetnames:
+            ws_in = wb_in[sheet_name]
+
+            # Skip chartsheets and hidden sheets to save memory
+            if (hasattr(ws_in, 'sheet_state') and ws_in.sheet_state == 'hidden') or \
+               (hasattr(ws_in, 'charts') and not hasattr(ws_in, 'iter_rows')):
+                continue
+
+            rows_processed = process_sheet(ws_in, sheet_name, f)
+            total_rows += rows_processed
+
+            # Force GC after each sheet to free memory
+            gc.collect()
 
     except Exception as e:
         print(f"Error processing file {f}: {e}")
     finally:
         if 'wb_in' in locals():
             wb_in.close()
-    return f
+        gc.collect()  # Clean up after each file
+
+    return f, total_rows
 
 # ----------------------
-# Writer thread with batching
+# Writer thread with memory awareness
 # ----------------------
 def writer():
     processed = 0
@@ -232,14 +225,18 @@ def writer():
                 ws_out.append(row)
                 processed += 1
 
-                # Progress reporting
-                if processed % 10000 == 0:
+                # Progress and memory reporting
+                if processed % 5000 == 0:
                     elapsed = time.time() - start_time
-                    print(f"Processed {processed} rows in {elapsed:.2f}s ({processed/elapsed:.0f} rows/s)")
+                    print(f"Processed {processed} rows in {elapsed:.2f}s ({processed/elapsed:.0f} rows/s) - Memory: {memory_counter}/{args.max_memory_rows}")
         else:
             ws_out.append(data)
 
         row_queue.task_done()
+
+        # Force GC periodically
+        if processed % 10000 == 0:
+            gc.collect()
 
     print(f"Total rows written: {processed}")
 
@@ -250,23 +247,35 @@ writer_thread = threading.Thread(target=writer)
 writer_thread.start()
 
 # ----------------------
-# Start reading threads with progress
+# Start reading threads with memory limits
 # ----------------------
 start_time = time.time()
+total_files_processed = 0
+
 with ThreadPoolExecutor(max_workers=args.threads) as executor:
     futures = {executor.submit(file_reader, f): f for f in files}
 
     for future in tqdm(as_completed(futures), total=len(futures), desc="Processing files"):
         try:
-            future.result()
+            f, rows_processed = future.result()
+            total_files_processed += 1
+            if total_files_processed % 10 == 0:
+                gc.collect()  # GC after every 10 files
         except Exception as e:
             print(f"Error: {e}")
 
 # ----------------------
-# Finish
+# Finish with cleanup
 # ----------------------
 row_queue.put("DONE")
 writer_thread.join()
+
+# Clean up large data structures
+if seen_rows:
+    seen_rows.clear()
+all_headers.clear()
+
+gc.collect()
 
 total_time = time.time() - start_time
 print(f"Processing completed in {total_time:.2f} seconds")
