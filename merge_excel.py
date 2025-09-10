@@ -61,22 +61,82 @@ all_headers = OrderedDict()
 header_ready = threading.Event()
 seen_rows = set() if not args.keep_duplicates else None
 
+def extract_data_from_chartsheet(ws):
+    """Extract data from chartsheet by checking for any available data"""
+    rows = []
+
+    # Try to get data from chart titles or any text elements
+    try:
+        # Chartsheets might have a title or some text content
+        if hasattr(ws, 'title'):
+            rows.append(['Chart_Title', ws.title])
+
+        # Some chartsheets might have embedded data tables
+        # This is a best-effort approach to extract any available data
+        if hasattr(ws, 'charts') and ws.charts:
+            for i, chart in enumerate(ws.charts):
+                # Try to get chart title
+                if hasattr(chart, 'title') and chart.title and hasattr(chart.title, 'text'):
+                    rows.append([f'Chart_{i}_Title', str(chart.title.text)])
+
+                # Try to get series names if available
+                if hasattr(chart, 'series') and chart.series:
+                    for j, series in enumerate(chart.series):
+                        series_name = getattr(series, 'name', f'Series_{j}')
+                        rows.append([f'Chart_{i}_Series_{j}', str(series_name)])
+    except Exception as e:
+        # If we can't extract data, just return empty
+        pass
+
+    return rows
+
+def process_sheet(ws, sheet_name, f):
+    """Process any type of sheet (worksheet or chartsheet)"""
+    rows = []
+
+    # Regular worksheet
+    if hasattr(ws, 'iter_rows'):
+        try:
+            for row in ws.iter_rows(values_only=True):
+                if row and any(cell is not None for cell in row):
+                    rows.append([str(cell).strip() if cell is not None else "" for cell in row])
+        except Exception as e:
+            print(f"Warning: Could not read worksheet '{sheet_name}' in file '{f}': {e}")
+
+    # Chartsheet - try to extract any available data
+    elif hasattr(ws, 'charts'):
+        try:
+            chart_data = extract_data_from_chartsheet(ws)
+            if chart_data:
+                rows.extend(chart_data)
+                # Add a simple header if we found data
+                if rows and len(rows[0]) == 2:
+                    rows.insert(0, ['Chart_Element', 'Value'])
+        except Exception as e:
+            print(f"Info: Limited data available in chartsheet '{sheet_name}' in file '{f}'")
+
+    # Hidden sheets
+    elif hasattr(ws, 'sheet_state') and ws.sheet_state == 'hidden':
+        print(f"Info: Skipping hidden sheet '{sheet_name}' in file '{f}'")
+        return []
+
+    return rows
+
 # ----------------------
 # Thread-safe queue for rows with batching
 # ----------------------
 row_queue = queue.Queue(maxsize=5000)
-batch_buffer = []
-batch_lock = threading.Lock()
 
 def file_reader(f):
     try:
         wb_in = load_workbook(f, read_only=True, data_only=True)
-        file_headers_cache = {}
         source_headers = ["source_file", "source_sheet"] if args.source_info else []
 
         for sheet_name in wb_in.sheetnames:
             ws_in = wb_in[sheet_name]
-            rows = list(ws_in.iter_rows(values_only=True))
+
+            # Process all types of sheets
+            rows = process_sheet(ws_in, sheet_name, f)
 
             if not rows:
                 continue
@@ -112,7 +172,7 @@ def file_reader(f):
             # Process data rows in batches
             batch = []
             for row in rows[1:]:  # Skip header row
-                if row is None:
+                if not row:
                     continue
 
                 # Create ordered row with pre-allocated list
